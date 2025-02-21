@@ -49,7 +49,26 @@ def get_info(
     part_out_dim : int
         The partitioned output dimension for the FC layer.
     """
-    #TODO: Your code here
+    # Compute the model parallel and data parallel indices
+    mp_idx = rank % mp_size # mp id within dp group (position within a DP group)
+    dp_idx = rank // mp_size # dp group id (which DP group this process belongs to)
+
+    # Create communicators for MP and DP group (for intra-group communication)
+    # mp_comm: All processes within the same DP group (same dp_idx) shared the same MP communicator
+    # dp_comm: All processes with the same MP group (same mp_idx) shared the same DP communicator
+    mp_comm = comm.Split(color=dp_idx, key=rank)  # All MP nodes in the same DP group
+    dp_comm = comm.Split(color=mp_idx, key=rank)  # All DP nodes across MP groups
+
+    # Determine the partitioned dimensions
+    if fc_layer in ['fc_q', 'fc_k', 'fc_v']:
+        part_in_dim = in_dim
+        part_out_dim = out_dim // mp_size # shard along out_dim
+    elif fc_layer == 'fc_o':
+        part_in_dim = in_dim // mp_size # shard along in_dim
+        part_out_dim = out_dim
+    else:
+        raise ValueError("Invalid fc_layer. Must be one of ['fc_q', 'fc_k', 'fc_v', 'fc_o'].")
+
     return mp_idx, dp_idx, mp_comm, dp_comm, part_in_dim, part_out_dim
 
 def naive_collect_forward_input(
@@ -65,9 +84,29 @@ def naive_collect_forward_input(
     After gathering, the full input should have shape:
       (batch_size, seq_length, part_in_dim * mp_size)
     """
-    #TODO: Your code here
-    return collected_x
+    batch_size, seq_length, part_in_dim = x.shape
 
+    # Ensure input is contiguous
+    x = np.ascontiguousarray(x)
+
+    # Prepare buffer for gathering full input tensor
+    gathered_x = None  # Non-root ranks should pass None in Gather()
+    if mp_comm.rank == 0:
+        gathered_x = np.empty((mp_size, batch_size, seq_length, part_in_dim), dtype=x.dtype)
+
+    # Gather all parts at rank 0
+    mp_comm.Gather(sendbuf=x, recvbuf=gathered_x, root=0)
+
+    # Reconstruct the full tensor at rank 0
+    if mp_comm.rank == 0:
+        collected_x = np.concatenate(gathered_x, axis=-1)  # Merge slices along last axis
+    else:
+        collected_x = np.empty((batch_size, seq_length, part_in_dim * mp_size), dtype=x.dtype)
+
+    # Broadcast full tensor to all MP ranks
+    mp_comm.Bcast(collected_x, root=0)
+
+    return collected_x
 
 def naive_collect_forward_output(
     out: np.ndarray,
@@ -82,7 +121,28 @@ def naive_collect_forward_output(
     After gathering, the full output should have shape:
       (batch_size, seq_length, part_out_dim * mp_size)
     """
-    #TODO: Your code here
+    batch_size, seq_length, part_out_dim = out.shape
+
+    # Ensure output is contiguous
+    out = np.ascontiguousarray(out)
+
+    # Prepare buffer for gathering full output tensor
+    gathered_out = None
+    if mp_comm.rank == 0:
+        gathered_out = np.empty((mp_size, batch_size, seq_length, part_out_dim), dtype=out.dtype)
+
+    # Gather all parts from MP ranks
+    mp_comm.Gather(sendbuf=out, recvbuf=gathered_out, root=0)
+
+    # Reconstruct the full tensor at rank 0
+    if mp_comm.rank == 0:
+        collected_out = np.concatenate(gathered_out, axis=-1)  # Merge slices along last axis
+    else:
+        collected_out = np.empty((batch_size, seq_length, part_out_dim * mp_size), dtype=out.dtype)
+
+    # Broadcast the full output tensor to all MP ranks
+    mp_comm.Bcast(collected_out, root=0)
+
     return collected_out
 
 def naive_collect_backward_output(
@@ -115,7 +175,17 @@ def naive_collect_backward_output(
         The local output gradient for this MP node with shape 
         (batch_size, seq_length, out_dim // mp_size).
     """
-    #TODO: Your code here
+    batch_size, seq_length, out_dim = output_grad.shape
+
+    # Compute the start and end indices for slicing
+    part_size = out_dim // mp_size
+    start_idx = mp_group_idx * part_size
+    end_idx = start_idx + part_size
+
+    # Slice the output gradient to get the local part
+    collected_output_grad = output_grad[:, :, start_idx:end_idx]
+
+    return collected_output_grad
 
 
 def naive_collect_backward_x(
@@ -150,4 +220,23 @@ def naive_collect_backward_x(
         The reduced and scattered grad_x with shape 
         (batch_size, seq_length, in_dim // mp_size).
     """
-    #TODO: Your code here
+    batch_size, seq_length, out_dim = grad_x.shape
+
+    # Ensure in_dim is divisible by mp_size
+    assert out_dim % mp_size == 0, "in_dim is not divisible by mp_size"
+
+    # Compute the size of each shard
+    part_size = out_dim // mp_size
+
+    # Prepare buffer for Reduce-Scatter
+    send_buf = np.empty((mp_size, batch_size, seq_length, part_size), dtype=grad_x.dtype)
+    collected_grad_x = np.empty((batch_size, seq_length, part_size), dtype=grad_x.dtype)
+
+    # Distribute grad_x among mp_size chunks before Reduce-Scatter
+    for i in range(mp_size):
+        send_buf[i] = grad_x[:, :, i * part_size : (i + 1) * part_size]
+
+    # Perform Reduce-Scatter across model parallel ranks
+    mp_comm.Reduce_scatter(sendbuf=send_buf, recvbuf=collected_grad_x)
+
+    return collected_grad_x
